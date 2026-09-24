@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>AR VTO — Interview Sandbox</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+ 
+    <div id="hud">
+      <div class="row"><span class="k">fps</span><span class="v" id="fps">—</span></div>
+      <div class="row">
+        <span class="k">face</span>
+        <span class="v"><span id="face-dot" class="dot"></span><span id="face-status">searching…</span></span>
+      </div>
+      <div class="row"><span class="k">video</span><span class="v" id="video-size">—</span></div>
+    </div>
+ 
+    <div id="error" role="alert"></div>
+ 
+    <div id="note">
+      Edit <code>src/update.ts</code>. Press <code>D</code> to toggle landmark debug dots.
+    </div>
+ 
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+ 
