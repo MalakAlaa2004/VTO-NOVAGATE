@@ -50,7 +50,7 @@ const LM_LEFT_EYE_IN   = 362; // Left eye inner corner (blink-immune)
 const REF_OUTER_CANTHAL_W = 0.092; // 92 mm average adult outer canthal width
 
 // Placement fine-tuning (meters, in model-local coordinates)
-const Y_OFFSET = -0.005; // Slight downward shift to sit on the nose bridge
+const Y_OFFSET = -0.012; // Downward shift to sit naturally on the nose bridge at eye level
 const Z_OFFSET = 0.010;  // 10 mm forward clearance so lenses don't clip the nose
 
 // ============================================================================
@@ -311,8 +311,8 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   const outerMidY = (lmROut.y + lmLOut.y) * 0.5;
   const innerMidY = (lmRIn.y + lmLIn.y) * 0.5;
   const eyeY = outerMidY * 0.5 + innerMidY * 0.5;
-  const bridgeY = lmNasion.y * 0.7 + lmGlabella.y * 0.3;
-  _anchorLm.y = bridgeY * 0.55 + eyeY * 0.45;
+  const bridgeY = lmNasion.y * 0.8 + lmGlabella.y * 0.2;
+  _anchorLm.y = bridgeY * 0.30 + eyeY * 0.70;
 
   _anchorLm.z = 0;
 
