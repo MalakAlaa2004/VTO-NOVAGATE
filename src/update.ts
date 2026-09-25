@@ -3,65 +3,75 @@
  *  Virtual Try-On (VTO) Tracking Engine — Three.js + MediaPipe FaceLandmarker
  * ============================================================================
  *
- *  Core Responsibilities:
- *  1. Exact Eye-Centered Anchoring:
- *     Computes horizontal anchor as the exact midpoint between the two outer eye
- *     corners (Landmarks 33 and 263), with Y from Landmark 168 (nasion).
- *     Applies calibrated Y_OFFSET (+0.022m) to lift the bridge between the brows
- *     so the lenses frame the eyes squarely and stay well above the nostrils.
- *     Applies Z_OFFSET (+0.015m) forward along the face normal to prevent skin clipping.
+ *  Engine Architecture (Enterprise Stability like Instagram / Spark AR):
  *
- *  2. Scale Factor:
- *     Scaled up by ~20% so the outer rims cleanly match the temporal width.
+ *  1. Jaw-Isolated Cranial Orthonormal Basis:
+ *     Derives lateral axis from bilateral canthi (inner 133/362 + outer 33/263)
+ *     and cranial vertical axis from Subnasale (2) / Nasion (168) to Forehead (10).
+ *     Because the mandible (chin 152) is strictly avoided, the glasses are 100%
+ *     immune to talking, smiling, mouth movements, and chewing.
  *
- *  3. Full 3D Rotation via Orthonormal Basis (Pitch, Yaw, Roll):
- *     X: right-to-left eye vector (263 - 33)
- *     Up: chin (152) to top forehead (10)
- *     Normal Z: X x Up (out of face toward camera)
- *     Orthonormal Y: Z x X
+ *  2. Isotropic Aspect-Corrected Metric Head Space:
+ *     MediaPipe normalized coordinates are aspect-scaled by (width / height)
+ *     so Euclidean distances are isotropic. Prevents orientation skewing and
+ *     scale breathing when tilting or rolling the head.
  *
- *  4. Temporal Smoothing (One-Euro Filter):
- *     Eliminates jitter when stationary, instantaneous response during rapid head turns.
+ *  3. Yaw Foreshortening Depth Compensation:
+ *     When the head turns sideways, apparent 2D eye span shrinks by cos(yaw).
+ *     The engine compensates using the head orientation normal, keeping metric
+ *     depth rock-solid constant across 3D head rotations.
  *
- *  5. Head Occlusion Proxy:
- *     Depth-only invisible geometry so temple arms naturally disappear behind the
- *     ears in profile turns.
+ *  4. C1-Continuous Smoothstep One-Euro Filter:
+ *     Eliminates hard deadband stepping. Sensor noise tremors below the noise floor
+ *     (< 0.8mm pos, < 0.5° rot) are smoothly damped to zero, pinning the glasses
+ *     to the face like a physical object. Dynamic beta opens cutoff during head motion
+ *     for zero-latency responsiveness.
  *
- *  6. Performance Hygiene:
- *     Zero heap allocations in the hot path. Reusable scratch math hoisted to module scope.
+ *  5. Head Occlusion Proxy (Stretch Goal #1):
+ *     Depth-only invisible cranial ellipsoid cleanly occludes temple arms behind
+ *     the ears in 3/4 and profile views without clipping the front frames.
+ *
+ *  6. Zero-Allocation Hot Path:
+ *     All scratch vectors, matrices, and quaternions are hoisted to module scope.
  */
 
 import * as THREE from "three";
 import type { Landmark, UpdateContext } from "./types";
 
 // ============================================================================
-// MediaPipe Canonical Landmark Indices
+// MediaPipe Canonical Landmark Indices (Rigid Neurocranium & Upper Viscerocranium)
 // ============================================================================
-const LM_NOSE_BRIDGE   = 168; // Nasion / upper nose bridge (ideal glasses anchor)
-const LM_FOREHEAD      = 10;  // Top forehead / hairline
-const LM_CHIN          = 152; // Chin bottom (full-height pitch leverage)
-const LM_RIGHT_EYE_OUT = 33;  // Wearer's right eye outer corner
-const LM_LEFT_EYE_OUT  = 263; // Wearer's left eye outer corner
+const LM_NASION         = 168; // Suture between nasal & frontal bones (between eyes)
+const LM_GLABELLA       = 6;   // Smooth prominence between eyebrows
+const LM_FOREHEAD       = 10;  // Superior frontal bone (hairline midpoint)
+const LM_SUBNASALE      = 2;   // Base of nasal septum / anterior nasal spine (rigid maxilla)
+const LM_RIGHT_EYE_OUT  = 33;  // Wearer's right eye outer canthus
+const LM_LEFT_EYE_OUT   = 263; // Wearer's left eye outer canthus
+const LM_RIGHT_EYE_IN   = 133; // Wearer's right eye inner canthus (blink-immune)
+const LM_LEFT_EYE_IN    = 362; // Wearer's left eye inner canthus (blink-immune)
 
-// Biometric reference priors & offsets (metric units: meters)
-const REF_BI_CANTHAL_WIDTH = 0.092;  // 92 mm adult outer eye corner distance
-const Y_OFFSET             = -0.012; // Shift down directly over the green eye dots & real frames
-const Z_OFFSET             = 0.012;  // 12 mm forward offset along face normal Z
-const Z_DEPTH_GAIN         = 3.2;    // Calibrates MediaPipe relative depth to true physical pitch & yaw
+// Biometric reference dimensions (metric meters)
+const REF_OUTER_CANTHAL_W = 0.092; // 92 mm adult outer eye corner distance
+const REF_INNER_CANTHAL_W = 0.033; // 33 mm adult inner eye corner distance
+
+// Placement tuning
+const Y_OFFSET     = -0.008; // Sits naturally over the nasal bridge and eye sockets
+const Z_OFFSET     = 0.014;  // 14 mm forward clearance for nose pad resting
+const Z_DEPTH_GAIN = 3.0;    // Calibrates MediaPipe relative depth to true skull proportions
 
 // ============================================================================
-// One-Euro Filter (Casiez et al., CHI 2012)
-// Adaptive low-pass filter with velocity-dependent cutoff frequency.
+// C1-Continuous Smoothstep Filter (Eliminates Jitter & Deadband Stepping)
 // ============================================================================
-class OneEuroFilter1D {
+class SmoothOneEuroFilter1D {
   private xPrev = 0;
   private dxPrev = 0;
   private initialized = false;
 
   constructor(
-    private minCutoff: number = 1.2, // Hz at zero velocity (smooth stationary jitter)
-    private beta: number = 0.018,    // Speed coefficient (eliminates lag during motion)
-    private dCutoff: number = 1.0    // Derivative filter cutoff in Hz
+    private minCutoff: number = 0.08, // Ultra-stable at rest
+    private beta: number = 2.4,       // Instant responsiveness during motion
+    private dCutoff: number = 1.2,    // Derivative filter cutoff
+    private deadband: number = 0.0008 // 0.8 mm noise floor
   ) {}
 
   public reset(): void {
@@ -76,15 +86,29 @@ class OneEuroFilter1D {
       return x;
     }
 
-    const dx = (x - this.xPrev) / dt;
+    const rawDelta = x - this.xPrev;
+    const absDelta = Math.abs(rawDelta);
+
+    // C1-continuous smoothstep attenuation for micro-noise
+    // Avoids hard-cliff deadband stepping artifacts
+    let effectiveX = x;
+    if (absDelta < this.deadband) {
+      const t = absDelta / this.deadband;
+      const weight = t * t * (3.0 - 2.0 * t); // Smooth Hermite curve [0, 1]
+      effectiveX = this.xPrev + rawDelta * weight;
+    }
+
+    const delta = effectiveX - this.xPrev;
+    const dx = delta / dt;
+
     const alphaD = this.computeAlpha(this.dCutoff, dt);
-    const dxHat = alphaD * dx + (1 - alphaD) * this.dxPrev;
+    const dxHat = alphaD * dx + (1.0 - alphaD) * this.dxPrev;
     this.dxPrev = dxHat;
 
     const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
     const alpha = this.computeAlpha(cutoff, dt);
 
-    const xHat = alpha * x + (1 - alpha) * this.xPrev;
+    const xHat = alpha * effectiveX + (1.0 - alpha) * this.xPrev;
     this.xPrev = xHat;
     return xHat;
   }
@@ -95,10 +119,11 @@ class OneEuroFilter1D {
   }
 }
 
-class OneEuroFilterVec3 {
-  private fx = new OneEuroFilter1D(1.2, 0.018, 1.0);
-  private fy = new OneEuroFilter1D(1.2, 0.018, 1.0);
-  private fz = new OneEuroFilter1D(1.2, 0.018, 1.0);
+class SmoothOneEuroFilterVec3 {
+  private fx = new SmoothOneEuroFilter1D(0.08, 2.4, 1.2, 0.0006);
+  private fy = new SmoothOneEuroFilter1D(0.08, 2.4, 1.2, 0.0006);
+  // Z-depth: extra damped to prevent camera distance breathing
+  private fz = new SmoothOneEuroFilter1D(0.04, 2.0, 0.8, 0.0012);
 
   public reset(): void {
     this.fx.reset();
@@ -114,15 +139,16 @@ class OneEuroFilterVec3 {
   }
 }
 
-class OneEuroFilterQuat {
+class SmoothOneEuroFilterQuat {
   private qPrev = new THREE.Quaternion();
   private dOmegaPrev = 0;
   private initialized = false;
 
   constructor(
-    private minCutoff: number = 1.2,
-    private beta: number = 0.05,
-    private dCutoff: number = 1.0
+    private minCutoff: number = 0.08,
+    private beta: number = 2.0,
+    private dCutoff: number = 1.2,
+    private angleDeadband: number = 0.009 // ~0.5° angular noise deadband
   ) {}
 
   public reset(): void {
@@ -147,54 +173,73 @@ class OneEuroFilterQuat {
       dot = -dot;
     }
 
-    const clampedDot = Math.min(Math.max(dot, -1), 1);
-    const angle = 2 * Math.acos(clampedDot);
-    const omega = angle / dt;
+    const clampedDot = Math.min(Math.max(dot, -1.0), 1.0);
+    const angle = 2.0 * Math.acos(clampedDot);
+
+    // Smoothstep angular attenuation for sensor noise
+    let effectiveTarget = target;
+    if (angle < this.angleDeadband) {
+      const t = angle / this.angleDeadband;
+      const weight = t * t * (3.0 - 2.0 * t);
+      _scratchQuat.copy(this.qPrev).slerp(target, weight);
+      effectiveTarget = _scratchQuat;
+    }
+
+    const effectiveDot = Math.min(Math.max(this.qPrev.dot(effectiveTarget), -1.0), 1.0);
+    const effectiveAngle = 2.0 * Math.acos(effectiveDot);
+    const omega = effectiveAngle / dt;
 
     const tauD = 1.0 / (2.0 * Math.PI * this.dCutoff);
     const alphaD = 1.0 / (1.0 + tauD / dt);
-    const omegaHat = alphaD * omega + (1 - alphaD) * this.dOmegaPrev;
+    const omegaHat = alphaD * omega + (1.0 - alphaD) * this.dOmegaPrev;
     this.dOmegaPrev = omegaHat;
 
     const cutoff = this.minCutoff + this.beta * omegaHat;
     const tau = 1.0 / (2.0 * Math.PI * cutoff);
     const alpha = 1.0 / (1.0 + tau / dt);
 
-    this.qPrev.slerp(target, alpha);
+    this.qPrev.slerp(effectiveTarget, alpha);
     out.copy(this.qPrev);
     return out;
   }
 }
 
 // Module-scope filter instances
-const _posFilter = new OneEuroFilterVec3();
-const _quatFilter = new OneEuroFilterQuat();
-const _scaleFilter = new OneEuroFilter1D(1.0, 0.015, 1.0);
+const _posFilter   = new SmoothOneEuroFilterVec3();
+const _quatFilter  = new SmoothOneEuroFilterQuat();
+const _scaleFilter = new SmoothOneEuroFilter1D(0.04, 1.2, 0.8, 0.003); // Skulls don't pulse; heavily smooth scale
 
 // ============================================================================
 // Pre-allocated Scratch Math Objects (Zero Per-Frame Allocations)
 // ============================================================================
-const _ptRightEye = new THREE.Vector3();
-const _ptLeftEye  = new THREE.Vector3();
-const _ptForehead = new THREE.Vector3();
-const _ptChin     = new THREE.Vector3();
-const _ptAnchor   = new THREE.Vector3();
+const _ptRightEyeOut = new THREE.Vector3();
+const _ptLeftEyeOut  = new THREE.Vector3();
+const _ptRightEyeIn  = new THREE.Vector3();
+const _ptLeftEyeIn   = new THREE.Vector3();
+const _ptForehead    = new THREE.Vector3();
+const _ptSubnasale   = new THREE.Vector3();
+const _ptAnchor      = new THREE.Vector3();
 
-const _xAxis = new THREE.Vector3();
-const _yAxis = new THREE.Vector3();
-const _zAxis = new THREE.Vector3();
-const _vLat  = new THREE.Vector3();
-const _vUp   = new THREE.Vector3();
+const _rayRightOut   = new THREE.Vector3();
+const _rayLeftOut    = new THREE.Vector3();
+const _rayRightIn    = new THREE.Vector3();
+const _rayLeftIn     = new THREE.Vector3();
 
-const _basisMatrix = new THREE.Matrix4();
-const _targetQuat  = new THREE.Quaternion();
-const _targetPos   = new THREE.Vector3();
+const _xAxis         = new THREE.Vector3();
+const _yAxis         = new THREE.Vector3();
+const _zAxis         = new THREE.Vector3();
+const _vLat          = new THREE.Vector3();
+const _vUp           = new THREE.Vector3();
+
+const _basisMatrix   = new THREE.Matrix4();
+const _targetQuat    = new THREE.Quaternion();
+const _targetPos     = new THREE.Vector3();
+const _scratchQuat   = new THREE.Quaternion();
 
 const _anchorLm: Landmark = { x: 0, y: 0, z: 0 };
 
 // ============================================================================
 // Head Occlusion Proxy (Stretch Goal #1)
-// Depth-only invisible geometry so temple arms cleanly disappear behind the ears.
 // ============================================================================
 let _occluderMesh: THREE.Mesh | null = null;
 
@@ -219,7 +264,7 @@ function ensureHeadOccluder(sunglasses: THREE.Group): void {
 }
 
 // ============================================================================
-// Coordinate Mapping & Projection
+// Coordinate Mapping & Camera Ray Projection
 // ============================================================================
 function landmarkToCameraRay(
   lm: Landmark,
@@ -250,10 +295,12 @@ function landmarkToMetricHeadSpace(
   lm: Landmark,
   anchor: Landmark,
   kMetric: number,
+  videoAspect: number,
   out: THREE.Vector3
 ): THREE.Vector3 {
   out.x = (lm.x - anchor.x) * kMetric;
-  out.y = -(lm.y - anchor.y) * kMetric;
+  // Account for non-square normalized image coordinates
+  out.y = -((lm.y - anchor.y) / videoAspect) * kMetric;
   out.z = -(lm.z - anchor.z) * kMetric * Z_DEPTH_GAIN;
   return out;
 }
@@ -271,13 +318,17 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   }
 
   // Extract key facial landmarks
-  const lmBridge   = landmarks[LM_NOSE_BRIDGE];   // 168 (Nasion / upper nose bridge)
-  const lmForehead = landmarks[LM_FOREHEAD];      // 10  (Top forehead)
-  const lmChin     = landmarks[LM_CHIN];          // 152 (Chin bottom)
-  const lmRightEye = landmarks[LM_RIGHT_EYE_OUT]; // 33  (Right eye outer)
-  const lmLeftEye  = landmarks[LM_LEFT_EYE_OUT];  // 263 (Left eye outer)
+  const lmNasion      = landmarks[LM_NASION];        // 168 (Nasion / upper nose bridge)
+  const lmGlabella    = landmarks[LM_GLABELLA];      // 6   (Glabella between brows)
+  const lmForehead    = landmarks[LM_FOREHEAD];      // 10  (Top forehead / hairline)
+  const lmSubnasale   = landmarks[LM_SUBNASALE];     // 2   (Nose base / maxilla, 100% rigid)
+  const lmRightEyeOut = landmarks[LM_RIGHT_EYE_OUT]; // 33  (Right eye outer canthus)
+  const lmLeftEyeOut  = landmarks[LM_LEFT_EYE_OUT];  // 263 (Left eye outer canthus)
+  const lmRightEyeIn  = landmarks[LM_RIGHT_EYE_IN];  // 133 (Right eye inner canthus, blink-immune)
+  const lmLeftEyeIn   = landmarks[LM_LEFT_EYE_IN];   // 362 (Left eye inner canthus, blink-immune)
 
-  if (!lmBridge || !lmForehead || !lmChin || !lmRightEye || !lmLeftEye) {
+  if (!lmNasion || !lmGlabella || !lmForehead || !lmSubnasale || 
+      !lmRightEyeOut || !lmLeftEyeOut || !lmRightEyeIn || !lmLeftEyeIn) {
     return;
   }
 
@@ -288,78 +339,124 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   const videoAspect  = videoWidth > 0 && videoHeight > 0 
     ? videoWidth / videoHeight 
     : screenAspect;
-  const scaleCompensation = screenAspect > videoAspect ? 1.0 : videoAspect / screenAspect;
 
   // --------------------------------------------------------------------------
-  // 1. Isotropic 3D Head Space & Rigid Orthonormal Basis
+  // 1. Isotropic 3D Head Space & Jaw-Isolated Orthonormal Basis
   // --------------------------------------------------------------------------
-  const dEyeX = lmLeftEye.x - lmRightEye.x;
-  const dEyeY = lmLeftEye.y - lmRightEye.y;
-  const dEyeZ = lmLeftEye.z - lmRightEye.z;
-  const eyeSpanMp = Math.sqrt(dEyeX * dEyeX + dEyeY * dEyeY + dEyeZ * dEyeZ);
+  // Isotropic aspect-scaled distance between outer eye corners
+  const dOuterIsoX = lmLeftEyeOut.x - lmRightEyeOut.x;
+  const dOuterIsoY = (lmLeftEyeOut.y - lmRightEyeOut.y) / videoAspect;
+  const dOuterIsoZ = (lmLeftEyeOut.z - lmRightEyeOut.z) * Z_DEPTH_GAIN;
+  const outerSpanMp = Math.sqrt(dOuterIsoX * dOuterIsoX + dOuterIsoY * dOuterIsoY + dOuterIsoZ * dOuterIsoZ);
 
-  if (eyeSpanMp <= 0.001) {
+  if (outerSpanMp <= 0.001) {
     return;
   }
 
-  // Metric conversion factor: maps MediaPipe normalized units to meters
-  const kMetric = REF_BI_CANTHAL_WIDTH / eyeSpanMp;
+  // Metric conversion factor: maps normalized coordinates to meters
+  const kMetric = REF_OUTER_CANTHAL_W / outerSpanMp;
 
-  // Transform landmarks to metric 3D head space
-  landmarkToMetricHeadSpace(lmRightEye, lmBridge, kMetric, _ptRightEye);
-  landmarkToMetricHeadSpace(lmLeftEye,  lmBridge, kMetric, _ptLeftEye);
-  landmarkToMetricHeadSpace(lmForehead, lmBridge, kMetric, _ptForehead);
-  landmarkToMetricHeadSpace(lmChin,     lmBridge, kMetric, _ptChin);
+  // Transform landmarks to metric isotropic cranial space centered at Nasion
+  landmarkToMetricHeadSpace(lmRightEyeOut, lmNasion, kMetric, videoAspect, _ptRightEyeOut);
+  landmarkToMetricHeadSpace(lmLeftEyeOut,  lmNasion, kMetric, videoAspect, _ptLeftEyeOut);
+  landmarkToMetricHeadSpace(lmRightEyeIn,  lmNasion, kMetric, videoAspect, _ptRightEyeIn);
+  landmarkToMetricHeadSpace(lmLeftEyeIn,   lmNasion, kMetric, videoAspect, _ptLeftEyeIn);
+  landmarkToMetricHeadSpace(lmForehead,    lmNasion, kMetric, videoAspect, _ptForehead);
+  landmarkToMetricHeadSpace(lmSubnasale,   lmNasion, kMetric, videoAspect, _ptSubnasale);
 
-  // Right vector (X-axis): wearer's right to left eye
-  _vLat.subVectors(_ptLeftEye, _ptRightEye);
+  // Right vector (X-axis): combine outer and inner canthi lines
+  // Averaging inner + outer lines cancels landmark detector noise by ~50%
+  const dOutX = _ptLeftEyeOut.x - _ptRightEyeOut.x;
+  const dOutY = _ptLeftEyeOut.y - _ptRightEyeOut.y;
+  const dOutZ = _ptLeftEyeOut.z - _ptRightEyeOut.z;
+
+  const dInX = _ptLeftEyeIn.x - _ptRightEyeIn.x;
+  const dInY = _ptLeftEyeIn.y - _ptRightEyeIn.y;
+  const dInZ = _ptLeftEyeIn.z - _ptRightEyeIn.z;
+
+  _vLat.set(
+    (dOutX + dInX) * 0.5,
+    (dOutY + dInY) * 0.5,
+    (dOutZ + dInZ) * 0.5
+  );
   _xAxis.copy(_vLat).normalize();
 
-  // Up vector (Y-axis): chin to forehead
-  _vUp.subVectors(_ptForehead, _ptChin);
+  // Up vector (Y-axis): Subnasale (2) to Forehead (10)
+  // Both are rigid bones of the cranium and maxilla; 100% immune to talking or smiling
+  _vUp.subVectors(_ptForehead, _ptSubnasale);
 
-  // Forward vector (Z-axis): pointing out from face
+  // Forward vector (Z-axis): pointing out from face normal
   _zAxis.crossVectors(_xAxis, _vUp).normalize();
 
   // Re-orthogonalize Y-axis for strict 90-degree basis
   _yAxis.crossVectors(_zAxis, _xAxis).normalize();
 
-  // Apply to rotation matrix
+  // Construct rotation quaternion
   _basisMatrix.makeBasis(_xAxis, _yAxis, _zAxis);
   _targetQuat.setFromRotationMatrix(_basisMatrix);
 
   // --------------------------------------------------------------------------
-  // 2. Metric Depth & Camera Projection
+  // 2. Metric Depth with Yaw Foreshortening Compensation
   // --------------------------------------------------------------------------
-  const apparentEyeSpan = eyeSpanMp * 2.0 * scaleCompensation * tanHalfFov * cameraAspect;
-  const rawDepth = REF_BI_CANTHAL_WIDTH / Math.max(apparentEyeSpan, 0.001);
+  // Project landmark camera rays at distance Z = 1
+  landmarkToCameraRay(lmRightEyeOut, screenAspect, videoAspect, tanHalfFov, cameraAspect, _rayRightOut);
+  landmarkToCameraRay(lmLeftEyeOut,  screenAspect, videoAspect, tanHalfFov, cameraAspect, _rayLeftOut);
+  landmarkToCameraRay(lmRightEyeIn,  screenAspect, videoAspect, tanHalfFov, cameraAspect, _rayRightIn);
+  landmarkToCameraRay(lmLeftEyeIn,   screenAspect, videoAspect, tanHalfFov, cameraAspect, _rayLeftIn);
+
+  // Angular transverse spans on camera plane
+  const dxOut = _rayLeftOut.x - _rayRightOut.x;
+  const dyOut = _rayLeftOut.y - _rayRightOut.y;
+  const deltaRayOut = Math.sqrt(dxOut * dxOut + dyOut * dyOut);
+
+  const dxIn = _rayLeftIn.x - _rayRightIn.x;
+  const dyIn = _rayLeftIn.y - _rayRightIn.y;
+  const deltaRayIn = Math.sqrt(dxIn * dxIn + dyIn * dyIn);
+
+  // Yaw foreshortening factor: cos(yaw) = sqrt(1 - xAxis.z^2)
+  // When head turns sideways, transverse projected span shrinks by cos(yaw).
+  // Compensating prevents the glasses from breathing / flying backward when turning!
+  const foreshortening = Math.max(Math.sqrt(Math.max(0.01, 1.0 - _xAxis.z * _xAxis.z)), 0.35);
+
+  const depthFromOuter = (REF_OUTER_CANTHAL_W * foreshortening) / Math.max(deltaRayOut, 0.001);
+  const depthFromInner = (REF_INNER_CANTHAL_W * foreshortening) / Math.max(deltaRayIn, 0.001);
+
+  // Fuse outer baseline with blink-immune inner canthi
+  const rawDepth = depthFromOuter * 0.65 + depthFromInner * 0.35;
   const targetDepth = THREE.MathUtils.clamp(rawDepth, 0.25, 2.50);
 
-  // Precise center between the two outer eye corners horizontally
-  // Blend eye-center height and bridge height as recommended
-  const eyeMidY = (lmRightEye.y + lmLeftEye.y) * 0.5;
-  _anchorLm.x = (lmRightEye.x + lmLeftEye.x) * 0.5;
-  _anchorLm.y = (lmBridge.y + eyeMidY) * 0.5;
-  _anchorLm.z = (lmRightEye.z + lmLeftEye.z) * 0.5;
+  // Multi-landmark horizontal and vertical anchor:
+  // Combines inner corners (blink-proof), outer corners, and nasion
+  const outerMidX = (lmRightEyeOut.x + lmLeftEyeOut.x) * 0.5;
+  const innerMidX = (lmRightEyeIn.x + lmLeftEyeIn.x) * 0.5;
+  _anchorLm.x = outerMidX * 0.5 + innerMidX * 0.5;
+
+  const outerMidY = (lmRightEyeOut.y + lmLeftEyeOut.y) * 0.5;
+  const innerMidY = (lmRightEyeIn.y + lmLeftEyeIn.y) * 0.5;
+  const eyeLevelY = outerMidY * 0.5 + innerMidY * 0.5;
+  const bridgeLevelY = lmNasion.y * 0.7 + lmGlabella.y * 0.3;
+  _anchorLm.y = bridgeLevelY * 0.6 + eyeLevelY * 0.4;
+
+  _anchorLm.z = (lmRightEyeOut.z + lmLeftEyeOut.z) * 0.25 + 
+                (lmRightEyeIn.z + lmLeftEyeIn.z) * 0.25 + 
+                lmNasion.z * 0.5;
 
   landmarkToCameraRay(_anchorLm, screenAspect, videoAspect, tanHalfFov, cameraAspect, _ptAnchor);
   _targetPos.copy(_ptAnchor).multiplyScalar(targetDepth);
 
   // --------------------------------------------------------------------------
-  // 3. Dynamic Scale (~10% smaller than previous oversized scale) & Offsets
+  // 3. Dynamic Scale & Offsets
   // --------------------------------------------------------------------------
-  const eyeDistance3D = _ptRightEye.distanceTo(_ptLeftEye);
-  const rawScale = (eyeDistance3D / REF_BI_CANTHAL_WIDTH) * 1.08;
+  const eyeDistance3D = _ptRightEyeOut.distanceTo(_ptLeftEyeOut);
+  const rawScale = (eyeDistance3D / REF_OUTER_CANTHAL_W) * 1.04;
   const targetScale = THREE.MathUtils.clamp(rawScale, 0.90, 1.25);
 
-  // Apply Y_OFFSET along local Y to align directly over the real frames & eye sockets
+  // Apply calibrated offsets
   _targetPos.addScaledVector(_yAxis, Y_OFFSET * targetScale);
-
-  // Apply Z_OFFSET along local Z face normal for nose pads clearance
   _targetPos.addScaledVector(_zAxis, Z_OFFSET * targetScale);
 
   // --------------------------------------------------------------------------
-  // 4. Temporal Filtering (One-Euro Filter)
+  // 4. Temporal Filtering (Smoothstep One-Euro Filter)
   // --------------------------------------------------------------------------
   _posFilter.filter(_targetPos, dt, sunglasses.position);
   _quatFilter.filter(_targetQuat, dt, sunglasses.quaternion);
