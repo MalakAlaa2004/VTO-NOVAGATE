@@ -28,4 +28,10 @@ export interface UpdateContext {
   videoHeight: number;
   /** Seconds elapsed since the previous detected frame. Useful for smoothing. */
   dt: number;
+  /**
+   * MediaPipe face transformation matrix (4×4, row-major `number[]`).
+   * Transforms canonical face model → detected face in camera space.
+   * Used for PnP-quality 3D rotation tracking.
+   */
+  faceMatrix?: number[];
 }

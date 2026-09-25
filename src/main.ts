@@ -259,7 +259,7 @@ async function startFaceLandmarker(): Promise<void> {
     runningMode: "VIDEO",
     numFaces: 1,
     outputFaceBlendshapes: false,
-    outputFacialTransformationMatrixes: false,
+    outputFacialTransformationMatrixes: true,
   });
 }
  
@@ -280,6 +280,7 @@ const ctx: UpdateContext = {
   videoWidth: 0,
   videoHeight: 0,
   dt: 0,
+  faceMatrix: undefined,
 };
  
 function loop(): void {
@@ -302,6 +303,9 @@ function loop(): void {
       ctx.videoHeight = video.videoHeight;
       ctx.dt = lastDetectMs < 0 ? 0 : (nowMs - lastDetectMs) / 1000;
       lastDetectMs = nowMs;
+
+      // Pass MediaPipe's PnP-solved face transformation matrix for 3D rotation.
+      ctx.faceMatrix = result.facialTransformationMatrixes?.[0]?.data;
  
       // ---- candidate code runs here ----
       update(face, ctx);
