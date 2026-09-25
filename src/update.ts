@@ -39,25 +39,25 @@ import * as THREE from "three";
 import type { Landmark, UpdateContext } from "./types";
 
 // ============================================================================
-// MediaPipe Canonical Landmark Indices (Rigid Neurocranium & Upper Viscerocranium)
+// MediaPipe Canonical Landmark Indices (Rigid Cephalometric Frame)
 // ============================================================================
 const LM_NASION         = 168; // Suture between nasal & frontal bones (between eyes)
 const LM_GLABELLA       = 6;   // Smooth prominence between eyebrows
-const LM_FOREHEAD       = 10;  // Superior frontal bone (hairline midpoint)
-const LM_SUBNASALE      = 2;   // Base of nasal septum / anterior nasal spine (rigid maxilla)
 const LM_RIGHT_EYE_OUT  = 33;  // Wearer's right eye outer canthus
 const LM_LEFT_EYE_OUT   = 263; // Wearer's left eye outer canthus
 const LM_RIGHT_EYE_IN   = 133; // Wearer's right eye inner canthus (blink-immune)
 const LM_LEFT_EYE_IN    = 362; // Wearer's left eye inner canthus (blink-immune)
+const LM_RIGHT_EAR      = 234; // Right tragus / zygomatic arch (ear level)
+const LM_LEFT_EAR       = 454; // Left tragus / zygomatic arch (ear level)
 
 // Biometric reference dimensions (metric meters)
 const REF_OUTER_CANTHAL_W = 0.092; // 92 mm adult outer eye corner distance
 const REF_INNER_CANTHAL_W = 0.033; // 33 mm adult inner eye corner distance
 
 // Placement tuning
-const Y_OFFSET     = -0.008; // Sits naturally over the nasal bridge and eye sockets
-const Z_OFFSET     = 0.014;  // 14 mm forward clearance for nose pad resting
-const Z_DEPTH_GAIN = 3.0;    // Calibrates MediaPipe relative depth to true skull proportions
+const Y_OFFSET     = -0.006; // Centers the circular lenses squarely over the eye line
+const Z_OFFSET     = 0.012;  // 12 mm forward offset along face normal for nose pads
+const Z_DEPTH_GAIN = 1.8;    // Calibrated metric depth ratio for cranial landmarks
 
 // ============================================================================
 // C1-Continuous Smoothstep Filter (Eliminates Jitter & Deadband Stepping)
@@ -216,8 +216,10 @@ const _ptRightEyeOut = new THREE.Vector3();
 const _ptLeftEyeOut  = new THREE.Vector3();
 const _ptRightEyeIn  = new THREE.Vector3();
 const _ptLeftEyeIn   = new THREE.Vector3();
-const _ptForehead    = new THREE.Vector3();
-const _ptSubnasale   = new THREE.Vector3();
+const _ptRightEar    = new THREE.Vector3();
+const _ptLeftEar     = new THREE.Vector3();
+const _ptNasion      = new THREE.Vector3();
+const _ptEarsMid     = new THREE.Vector3();
 const _ptAnchor      = new THREE.Vector3();
 
 const _rayRightOut   = new THREE.Vector3();
@@ -229,7 +231,7 @@ const _xAxis         = new THREE.Vector3();
 const _yAxis         = new THREE.Vector3();
 const _zAxis         = new THREE.Vector3();
 const _vLat          = new THREE.Vector3();
-const _vUp           = new THREE.Vector3();
+const _vFwd          = new THREE.Vector3();
 
 const _basisMatrix   = new THREE.Matrix4();
 const _targetQuat    = new THREE.Quaternion();
@@ -320,15 +322,16 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   // Extract key facial landmarks
   const lmNasion      = landmarks[LM_NASION];        // 168 (Nasion / upper nose bridge)
   const lmGlabella    = landmarks[LM_GLABELLA];      // 6   (Glabella between brows)
-  const lmForehead    = landmarks[LM_FOREHEAD];      // 10  (Top forehead / hairline)
-  const lmSubnasale   = landmarks[LM_SUBNASALE];     // 2   (Nose base / maxilla, 100% rigid)
   const lmRightEyeOut = landmarks[LM_RIGHT_EYE_OUT]; // 33  (Right eye outer canthus)
   const lmLeftEyeOut  = landmarks[LM_LEFT_EYE_OUT];  // 263 (Left eye outer canthus)
   const lmRightEyeIn  = landmarks[LM_RIGHT_EYE_IN];  // 133 (Right eye inner canthus, blink-immune)
   const lmLeftEyeIn   = landmarks[LM_LEFT_EYE_IN];   // 362 (Left eye inner canthus, blink-immune)
+  const lmRightEar    = landmarks[LM_RIGHT_EAR];     // 234 (Right tragus / ear level)
+  const lmLeftEar     = landmarks[LM_LEFT_EAR];      // 454 (Left tragus / ear level)
 
-  if (!lmNasion || !lmGlabella || !lmForehead || !lmSubnasale || 
-      !lmRightEyeOut || !lmLeftEyeOut || !lmRightEyeIn || !lmLeftEyeIn) {
+  if (!lmNasion || !lmGlabella || 
+      !lmRightEyeOut || !lmLeftEyeOut || !lmRightEyeIn || !lmLeftEyeIn ||
+      !lmRightEar || !lmLeftEar) {
     return;
   }
 
@@ -341,7 +344,7 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
     : screenAspect;
 
   // --------------------------------------------------------------------------
-  // 1. Isotropic 3D Head Space & Jaw-Isolated Orthonormal Basis
+  // 1. Isotropic 3D Head Space & Ear-to-Nose Cephalometric Basis
   // --------------------------------------------------------------------------
   // Isotropic aspect-scaled distance between outer eye corners
   const dOuterIsoX = lmLeftEyeOut.x - lmRightEyeOut.x;
@@ -361,8 +364,9 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   landmarkToMetricHeadSpace(lmLeftEyeOut,  lmNasion, kMetric, videoAspect, _ptLeftEyeOut);
   landmarkToMetricHeadSpace(lmRightEyeIn,  lmNasion, kMetric, videoAspect, _ptRightEyeIn);
   landmarkToMetricHeadSpace(lmLeftEyeIn,   lmNasion, kMetric, videoAspect, _ptLeftEyeIn);
-  landmarkToMetricHeadSpace(lmForehead,    lmNasion, kMetric, videoAspect, _ptForehead);
-  landmarkToMetricHeadSpace(lmSubnasale,   lmNasion, kMetric, videoAspect, _ptSubnasale);
+  landmarkToMetricHeadSpace(lmRightEar,    lmNasion, kMetric, videoAspect, _ptRightEar);
+  landmarkToMetricHeadSpace(lmLeftEar,     lmNasion, kMetric, videoAspect, _ptLeftEar);
+  landmarkToMetricHeadSpace(lmNasion,      lmNasion, kMetric, videoAspect, _ptNasion);
 
   // Right vector (X-axis): combine outer and inner canthi lines
   // Averaging inner + outer lines cancels landmark detector noise by ~50%
@@ -381,14 +385,16 @@ export function update(landmarks: Landmark[], ctx: UpdateContext): void {
   );
   _xAxis.copy(_vLat).normalize();
 
-  // Up vector (Y-axis): Subnasale (2) to Forehead (10)
-  // Both are rigid bones of the cranium and maxilla; 100% immune to talking or smiling
-  _vUp.subVectors(_ptForehead, _ptSubnasale);
+  // Forward vector (Z-axis): from midpoint of the ears to the nasion (nose bridge)
+  // Both ears and nasion lie on the Frankfurt horizontal plane of eyewear.
+  // Temple arms run along -Z directly to the ears without downward slant into cheeks.
+  _ptEarsMid.addVectors(_ptRightEar, _ptLeftEar).multiplyScalar(0.5);
+  _vFwd.subVectors(_ptNasion, _ptEarsMid);
 
-  // Forward vector (Z-axis): pointing out from face normal
-  _zAxis.crossVectors(_xAxis, _vUp).normalize();
+  // Orthogonalize Z against X: Z = normalize(vFwd - (vFwd · X) * X)
+  _zAxis.copy(_vFwd).addScaledVector(_xAxis, -_vFwd.dot(_xAxis)).normalize();
 
-  // Re-orthogonalize Y-axis for strict 90-degree basis
+  // Up vector (Y-axis): Y = Z × X (strictly perpendicular right-handed basis)
   _yAxis.crossVectors(_zAxis, _xAxis).normalize();
 
   // Construct rotation quaternion
