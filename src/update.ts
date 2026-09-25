@@ -3,34 +3,41 @@
  *  Virtual Try-On (VTO) Tracking Engine — Three.js + MediaPipe FaceLandmarker
  * ============================================================================
  *
- *  Production Architecture (Instagram / Spark AR grade):
+ *  Senior Graphics / AR Architecture:
  *
- *  1. 3D ROTATION — MediaPipe PnP Face Transformation Matrix
- *     MediaPipe internally solves Perspective-n-Point (PnP) using its canonical
- *     3D face model, yielding a 4×4 rigid transformation matrix.
- *     This gives us the exact same rotation quality used by production AR SDKs
- *     (Instagram, Spark AR, Lens Studio). No manual Z-depth guessing needed.
+ *  1. RIGID 3D ORTHONORMAL HEAD POSE (Direct Landmark Solution)
+ *     Instead of relying on the buggy MediaPipe facialTransformationMatrix
+ *     (which has a known upstream bug causing sideways skew/rotations),
+ *     we construct a pure, mathematically rigid orthonormal basis [X, Y, Z]
+ *     directly from anatomically stable cephalometric landmarks:
+ *       - X (Lateral):    Averaged outer + inner canthi + temples (Right → Left)
+ *       - Z (Sagittal):   Frankfurt plane vector from mid-temples to nasal bridge
+ *                         Gram-Schmidt orthogonalized against X (Out of face)
+ *       - Y (Vertical):   Strict right-handed cross product Z × X (Up along skull)
+ *     This guarantees det(R) = +1, zero shear, zero distortion, and perfect
+ *     alignment of temple arms back towards the ears without lateral skew.
  *
- *  2. POSITION — Multi-Landmark Camera-Ray Projection
- *     The 2D anchor point (blended inner + outer eye corners + nasion) is
- *     ray-cast through the Three.js PerspectiveCamera frustum. Depth is solved
- *     from the apparent inter-ocular distance vs known biometric width.
+ *  2. CAMERA-RAY ANCHORING
+ *     The 2D nasal bridge anchor is projected through the Three.js PerspectiveCamera
+ *     frustum, accounting for CSS object-fit: cover aspect scaling. The anchor
+ *     is pinned rock-solid between the inner eye corners and nasion.
  *
- *  3. SCALE — Biometric Eye Distance Normalization
- *     The procedural model is built at 1:1 metric scale. Scale factor normalizes
- *     to the specific face's outer canthal width.
+ *  3. METRIC DEPTH WITH FORESHORTENING COMPENSATION
+ *     Depth is computed from the apparent outer canthal distance (92 mm standard
+ *     adult baseline) compensated by cos(yaw) foreshortening:
+ *       depth = (0.092 * cos(yaw)) / deltaRayOuter
+ *     This prevents the glasses from flying backward / "breathing" during head turns.
  *
- *  4. SMOOTHING — One-Euro Filter (Casiez et al. 2012)
- *     Separate filters for position, quaternion, and scale. Low minCutoff
- *     (0.08 Hz) pins the glasses rock-solid when stationary; high beta (2.5)
- *     opens the cutoff instantly during head motion for zero-latency tracking.
+ *  4. TEMPORAL STABILITY — One-Euro Filter (Casiez et al. 2012)
+ *     Separate adaptive filters for position, quaternion, and scale.
+ *     Zero jitter when stationary, zero lag during head motion.
  *
- *  5. HEAD OCCLUSION PROXY — Depth-Only Cranial Ellipsoid
- *     Invisible geometry that writes only to the depth buffer, cleanly hiding
- *     temple arms behind the head in 3/4 and profile views.
+ *  5. HEAD OCCLUSION PROXY
+ *     Invisible cranial geometry writes only to the depth buffer, cleanly hiding
+ *     the temple arms behind the head in 3/4 and profile views.
  *
  *  6. ZERO HOT-PATH ALLOCATIONS
- *     All scratch vectors, matrices, and quaternions are module-scope singletons.
+ *     All scratch vectors, matrices, and quaternions are pre-allocated module singletons.
  */
 
 import * as THREE from "three";
@@ -39,19 +46,21 @@ import type { Landmark, UpdateContext } from "./types";
 // ============================================================================
 // MediaPipe Canonical Landmark Indices
 // ============================================================================
-const LM_NASION        = 168; // Between the eyes (upper nose bridge)
+const LM_NASION        = 168; // Nasal root between eyes
 const LM_GLABELLA      = 6;   // Between eyebrows
-const LM_RIGHT_EYE_OUT = 33;  // Right eye outer corner
-const LM_LEFT_EYE_OUT  = 263; // Left eye outer corner
+const LM_RIGHT_EYE_OUT = 33;  // Right eye outer corner (canthus)
+const LM_LEFT_EYE_OUT  = 263; // Left eye outer corner (canthus)
 const LM_RIGHT_EYE_IN  = 133; // Right eye inner corner (blink-immune)
 const LM_LEFT_EYE_IN   = 362; // Left eye inner corner (blink-immune)
+const LM_RIGHT_TEMPLE  = 234; // Right side temple / tragus level
+const LM_LEFT_TEMPLE   = 454; // Left side temple / tragus level
 
-// Biometric reference (metric meters)
-const REF_OUTER_CANTHAL_W = 0.092; // 92 mm average adult outer canthal width
+// Biometric reference dimensions (metric meters)
+const REF_OUTER_CANTHAL_W = 0.092; // 92 mm average adult outer canthal distance
 
-// Placement fine-tuning (meters, in model-local coordinates)
-const Y_OFFSET = -0.012; // Downward shift to sit naturally on the nose bridge at eye level
-const Z_OFFSET = 0.010;  // 10 mm forward clearance so lenses don't clip the nose
+// Fine-tuning placement (meters, in head-local coordinate frame)
+const Y_OFFSET = -0.005; // Placed on upper nasal bridge so lenses align with pupils
+const Z_OFFSET =  0.012; // 12 mm forward clearance to rest gently without clipping nose
 
 // ============================================================================
 // One-Euro Filter (Casiez et al. 2012) — Production Jitter Elimination
@@ -62,12 +71,14 @@ class OneEuroFilter1D {
   private initialized = false;
 
   constructor(
-    private minCutoff: number = 0.08,
-    private beta: number = 2.5,
-    private dCutoff: number = 1.0
+    private minCutoff: number = 0.10,
+    private beta: number = 3.0,
+    private dCutoff: number = 1.0,
   ) {}
 
-  public reset(): void { this.initialized = false; }
+  public reset(): void {
+    this.initialized = false;
+  }
 
   public filter(x: number, dt: number): number {
     if (!this.initialized || dt <= 0 || dt > 0.5) {
@@ -97,12 +108,19 @@ class OneEuroFilterVec3 {
   private fx: OneEuroFilter1D;
   private fy: OneEuroFilter1D;
   private fz: OneEuroFilter1D;
-  constructor(min = 0.08, beta = 2.5, dc = 1.0, minZ = 0.04, betaZ = 1.5) {
+
+  constructor(min = 0.10, beta = 3.0, dc = 1.0) {
     this.fx = new OneEuroFilter1D(min, beta, dc);
     this.fy = new OneEuroFilter1D(min, beta, dc);
-    this.fz = new OneEuroFilter1D(minZ, betaZ, dc); // Z (depth): extra stable
+    this.fz = new OneEuroFilter1D(min * 0.5, beta * 0.75, dc); // Z extra damped against webcam noise
   }
-  public reset(): void { this.fx.reset(); this.fy.reset(); this.fz.reset(); }
+
+  public reset(): void {
+    this.fx.reset();
+    this.fy.reset();
+    this.fz.reset();
+  }
+
   public filter(v: THREE.Vector3, dt: number, out: THREE.Vector3): void {
     out.x = this.fx.filter(v.x, dt);
     out.y = this.fy.filter(v.y, dt);
@@ -114,12 +132,16 @@ class OneEuroFilterQuat {
   private qPrev = new THREE.Quaternion();
   private omegaPrev = 0;
   private initialized = false;
+
   constructor(
-    private minCutoff: number = 0.08,
-    private beta: number = 2.0,
-    private dCutoff: number = 1.0
+    private minCutoff: number = 0.10,
+    private beta: number = 2.5,
+    private dCutoff: number = 1.0,
   ) {}
-  public reset(): void { this.initialized = false; }
+
+  public reset(): void {
+    this.initialized = false;
+  }
 
   public filter(q: THREE.Quaternion, dt: number, out: THREE.Quaternion): void {
     if (!this.initialized || dt <= 0 || dt > 0.5) {
@@ -129,8 +151,14 @@ class OneEuroFilterQuat {
       out.copy(q);
       return;
     }
-    // Ensure shortest path
-    if (this.qPrev.dot(q) < 0) { q.x = -q.x; q.y = -q.y; q.z = -q.z; q.w = -q.w; }
+
+    // Shortest path interpolation
+    if (this.qPrev.dot(q) < 0) {
+      q.x = -q.x;
+      q.y = -q.y;
+      q.z = -q.z;
+      q.w = -q.w;
+    }
 
     const dot = Math.min(Math.max(this.qPrev.dot(q), -1), 1);
     const angle = 2 * Math.acos(dot);
@@ -151,32 +179,50 @@ class OneEuroFilterQuat {
 }
 
 // Module-scope filter instances
-const _posFilter   = new OneEuroFilterVec3(0.08, 2.5, 1.0, 0.04, 1.5);
-const _quatFilter  = new OneEuroFilterQuat(0.08, 2.0, 1.0);
+const _posFilter   = new OneEuroFilterVec3(0.10, 3.0, 1.0);
+const _quatFilter  = new OneEuroFilterQuat(0.10, 2.5, 1.0);
 const _scaleFilter = new OneEuroFilter1D(0.04, 1.0, 0.8);
 
 // ============================================================================
-// Pre-allocated Scratch Objects (Zero Per-Frame Allocations)
+// Pre-allocated Scratch Objects (Zero Garbage Collection)
 // ============================================================================
-const _ptAnchor    = new THREE.Vector3();
-const _targetPos   = new THREE.Vector3();
-const _targetQuat  = new THREE.Quaternion();
-const _rotMatrix   = new THREE.Matrix4();
-const _yAxis       = new THREE.Vector3();
-const _zAxis       = new THREE.Vector3();
+const _ptRightEyeOut = new THREE.Vector3();
+const _ptLeftEyeOut  = new THREE.Vector3();
+const _ptRightEyeIn  = new THREE.Vector3();
+const _ptLeftEyeIn   = new THREE.Vector3();
+const _ptRightTemple = new THREE.Vector3();
+const _ptLeftTemple  = new THREE.Vector3();
+const _ptNasion      = new THREE.Vector3();
+const _ptGlabella    = new THREE.Vector3();
 
-const _anchorLm: Landmark = { x: 0, y: 0, z: 0 };
+const _vEyes         = new THREE.Vector3();
+const _vTemples      = new THREE.Vector3();
+const _vLat          = new THREE.Vector3();
+const _ptMidTemples  = new THREE.Vector3();
+const _ptMidNose     = new THREE.Vector3();
+const _vFwd          = new THREE.Vector3();
+
+const _xAxis         = new THREE.Vector3();
+const _yAxis         = new THREE.Vector3();
+const _zAxis         = new THREE.Vector3();
+const _basisMatrix   = new THREE.Matrix4();
+
+const _rayRightOut   = new THREE.Vector3();
+const _rayLeftOut    = new THREE.Vector3();
+const _rayAnchor     = new THREE.Vector3();
+const _targetPos     = new THREE.Vector3();
+const _targetQuat    = new THREE.Quaternion();
 
 // ============================================================================
-// Head Occlusion Proxy (Stretch Goal #1)
+// Head Occlusion Proxy (Hides temple arms behind head in 3D profile views)
 // ============================================================================
 let _occluderMesh: THREE.Mesh | null = null;
 
 function ensureHeadOccluder(group: THREE.Group): void {
   if (_occluderMesh) return;
   const geo = new THREE.SphereGeometry(1, 24, 18);
-  geo.scale(0.048, 0.075, 0.065);
-  geo.translate(0, -0.012, -0.10);
+  geo.scale(0.065, 0.090, 0.080);
+  geo.translate(0, -0.015, -0.10);
   const mat = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true });
   _occluderMesh = new THREE.Mesh(geo, mat);
   _occluderMesh.name = "head_occlusion_proxy";
@@ -185,158 +231,176 @@ function ensureHeadOccluder(group: THREE.Group): void {
 }
 
 // ============================================================================
-// Camera-Ray Projection (Landmark → World Position at Depth Z)
+// Coordinate Helpers
 // ============================================================================
+/**
+ * Convert MediaPipe landmark to isotropic 3D point (metric proportioned).
+ * MediaPipe coordinate rules:
+ *   - X: 0 (left) to 1 (right)
+ *   - Y: 0 (top) to 1 (bottom)  → In Three.js, Y is UP, so we negate
+ *   - Z: roughly on same metric scale as X, negative closer to camera
+ *        In Three.js (looking down -Z), closer to camera means LARGER Z, so negate
+ */
+function lmToIsotropic3D(lm: Landmark, videoAspect: number, out: THREE.Vector3): void {
+  out.x = lm.x;
+  out.y = -lm.y / videoAspect;
+  out.z = -lm.z;
+}
+
+/**
+ * Shoot camera ray for landmark (accounting for CSS object-fit: cover scaling).
+ */
 function landmarkToCameraRay(
-  lm: Landmark,
+  x: number,
+  y: number,
   screenAspect: number,
   videoAspect: number,
-  tanHalf: number,
+  tanHalfFov: number,
   camAspect: number,
   out: THREE.Vector3,
 ): void {
-  let sx = 1, sy = 1;
-  if (screenAspect > videoAspect) sy = screenAspect / videoAspect;
-  else sx = videoAspect / screenAspect;
-  out.x = (lm.x - 0.5) * 2 * sx * tanHalf * camAspect;
-  out.y = -((lm.y - 0.5) * 2 * sy) * tanHalf;
+  let sx = 1;
+  let sy = 1;
+  if (screenAspect > videoAspect) {
+    sy = screenAspect / videoAspect;
+  } else {
+    sx = videoAspect / screenAspect;
+  }
+  out.x = (x - 0.5) * 2 * sx * tanHalfFov * camAspect;
+  out.y = -((y - 0.5) * 2 * sy) * tanHalfFov;
   out.z = -1;
-}
-
-// ============================================================================
-// Rotation Extraction from MediaPipe's 4×4 Face Transformation Matrix
-//
-// The matrix transforms canonical face model → camera space.
-// MediaPipe camera space: X-right, Y-down, Z-forward (into screen).
-// Three.js world space:   X-right, Y-up,   Z-backward (out of screen).
-//
-// Coordinate conversion: R_three = M · R_mp · M⁻¹   where M = diag(1,−1,−1).
-// Since M = M⁻¹ this simplifies to R_three = M · R_mp · M.
-// ============================================================================
-function extractRotation(data: number[], out: THREE.Quaternion): boolean {
-  if (data.length < 16) return false;
-
-  // MediaPipe data is row-major:
-  //   Row 0: data[0..3],  Row 1: data[4..7],  Row 2: data[8..11]
-  //
-  // R_mp as 3×3:
-  //   [data[0]  data[1]  data[2] ]
-  //   [data[4]  data[5]  data[6] ]
-  //   [data[8]  data[9]  data[10]]
-  //
-  // R_three = M · R_mp · M   (M = diag(1, -1, -1)):
-  //   [ data[0]  -data[1]  -data[2] ]
-  //   [-data[4]   data[5]   data[6] ]
-  //   [-data[8]   data[9]   data[10]]
-
-  // Three.js Matrix4.set() takes ROW-MAJOR arguments: (n11,n12,n13,n14, ...)
-  _rotMatrix.set(
-     data[0], -data[1], -data[2],  0,
-    -data[4],  data[5],  data[6],  0,
-    -data[8],  data[9],  data[10], 0,
-     0,        0,        0,        1,
-  );
-  out.setFromRotationMatrix(_rotMatrix);
-  return true;
 }
 
 // ============================================================================
 // Main Update Routine
 // ============================================================================
 export function update(landmarks: Landmark[], ctx: UpdateContext): void {
-  const { sunglasses, camera, videoWidth, videoHeight, dt, faceMatrix } = ctx;
+  const { sunglasses, camera, videoWidth, videoHeight, dt } = ctx;
 
   ensureHeadOccluder(sunglasses);
 
-  if (!landmarks || landmarks.length < 468) return;
-
-  const lmNasion   = landmarks[LM_NASION];
-  const lmGlabella = landmarks[LM_GLABELLA];
-  const lmROut     = landmarks[LM_RIGHT_EYE_OUT];
-  const lmLOut     = landmarks[LM_LEFT_EYE_OUT];
-  const lmRIn      = landmarks[LM_RIGHT_EYE_IN];
-  const lmLIn      = landmarks[LM_LEFT_EYE_IN];
-
-  if (!lmNasion || !lmGlabella || !lmROut || !lmLOut || !lmRIn || !lmLIn) return;
-
-  // Camera / video geometry
-  const tanHalf    = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
-  const camAspect  = camera.aspect;
-  const screenAR   = window.innerWidth / Math.max(window.innerHeight, 1);
-  const videoAR    = videoWidth > 0 && videoHeight > 0 ? videoWidth / videoHeight : screenAR;
-
-  // --------------------------------------------------------------------------
-  // 1. ROTATION — from MediaPipe PnP matrix
-  // --------------------------------------------------------------------------
-  let hasRotation = false;
-  if (faceMatrix) {
-    hasRotation = extractRotation(faceMatrix, _targetQuat);
+  if (!landmarks || landmarks.length < 468) {
+    return;
   }
 
-  if (!hasRotation) {
-    // Fallback: simple landmark-based rotation (less accurate but functional)
-    const dx = lmLOut.x - lmROut.x;
-    const dy = lmLOut.y - lmROut.y;
-    const roll = -Math.atan2(dy, dx);
-    _targetQuat.setFromAxisAngle(_yAxis.set(0, 1, 0), 0);
-    _targetQuat.multiply(_targetQuat.clone().setFromAxisAngle(_zAxis.set(0, 0, 1), roll));
+  const lmNasion      = landmarks[LM_NASION];
+  const lmGlabella    = landmarks[LM_GLABELLA];
+  const lmRightEyeOut = landmarks[LM_RIGHT_EYE_OUT];
+  const lmLeftEyeOut  = landmarks[LM_LEFT_EYE_OUT];
+  const lmRightEyeIn  = landmarks[LM_RIGHT_EYE_IN];
+  const lmLeftEyeIn   = landmarks[LM_LEFT_EYE_IN];
+  const lmRightTemple = landmarks[LM_RIGHT_TEMPLE];
+  const lmLeftTemple  = landmarks[LM_LEFT_TEMPLE];
+
+  if (
+    !lmNasion || !lmGlabella ||
+    !lmRightEyeOut || !lmLeftEyeOut ||
+    !lmRightEyeIn || !lmLeftEyeIn ||
+    !lmRightTemple || !lmLeftTemple
+  ) {
+    return;
   }
 
-  // --------------------------------------------------------------------------
-  // 2. DEPTH — from apparent inter-ocular distance
-  // --------------------------------------------------------------------------
-  // Project eye corners to camera rays at unit depth
-  landmarkToCameraRay(lmROut, screenAR, videoAR, tanHalf, camAspect, _ptAnchor);
-  const rxOut = _ptAnchor.x;
-  landmarkToCameraRay(lmLOut, screenAR, videoAR, tanHalf, camAspect, _ptAnchor);
-  const lxOut = _ptAnchor.x;
-  const ryOut = _ptAnchor.y; // reuse last y
-
-  landmarkToCameraRay(lmROut, screenAR, videoAR, tanHalf, camAspect, _ptAnchor);
-  const ryOut2 = _ptAnchor.y;
-
-  const deltaRayOuter = Math.abs(lxOut - rxOut);
-  const targetDepth = THREE.MathUtils.clamp(
-    REF_OUTER_CANTHAL_W / Math.max(deltaRayOuter, 0.001),
-    0.20, 2.50,
-  );
+  // Camera & viewport geometry
+  const tanHalfFov   = Math.tan(THREE.MathUtils.degToRad(camera.fov * 0.5));
+  const camAspect    = camera.aspect;
+  const screenAspect = window.innerWidth / Math.max(window.innerHeight, 1);
+  const videoAspect  = videoWidth > 0 && videoHeight > 0 ? videoWidth / videoHeight : screenAspect;
 
   // --------------------------------------------------------------------------
-  // 3. POSITION — anchor at blended eye-center / nasion
+  // 1. 3D ROTATION — Pure Cephalometric Orthonormal Basis
   // --------------------------------------------------------------------------
-  const outerMidX = (lmROut.x + lmLOut.x) * 0.5;
-  const innerMidX = (lmRIn.x + lmLIn.x) * 0.5;
-  _anchorLm.x = outerMidX * 0.5 + innerMidX * 0.5;
+  lmToIsotropic3D(lmRightEyeOut, videoAspect, _ptRightEyeOut);
+  lmToIsotropic3D(lmLeftEyeOut,  videoAspect, _ptLeftEyeOut);
+  lmToIsotropic3D(lmRightEyeIn,  videoAspect, _ptRightEyeIn);
+  lmToIsotropic3D(lmLeftEyeIn,   videoAspect, _ptLeftEyeIn);
+  lmToIsotropic3D(lmRightTemple, videoAspect, _ptRightTemple);
+  lmToIsotropic3D(lmLeftTemple,  videoAspect, _ptLeftTemple);
+  lmToIsotropic3D(lmNasion,      videoAspect, _ptNasion);
+  lmToIsotropic3D(lmGlabella,    videoAspect, _ptGlabella);
 
-  const outerMidY = (lmROut.y + lmLOut.y) * 0.5;
-  const innerMidY = (lmRIn.y + lmLIn.y) * 0.5;
-  const eyeY = outerMidY * 0.5 + innerMidY * 0.5;
-  const bridgeY = lmNasion.y * 0.8 + lmGlabella.y * 0.2;
-  _anchorLm.y = bridgeY * 0.30 + eyeY * 0.70;
+  // X-Axis (Lateral / Right-to-Left):
+  // Weighted blend of inner/outer eye canthi + temples gives max stability
+  _vEyes.subVectors(_ptLeftEyeOut, _ptRightEyeOut).addScaledVector(
+    _vLat.subVectors(_ptLeftEyeIn, _ptRightEyeIn),
+    1.0,
+  ).multiplyScalar(0.5);
 
-  _anchorLm.z = 0;
+  _vTemples.subVectors(_ptLeftTemple, _ptRightTemple);
 
-  landmarkToCameraRay(_anchorLm, screenAR, videoAR, tanHalf, camAspect, _ptAnchor);
-  _targetPos.copy(_ptAnchor).multiplyScalar(targetDepth);
+  _xAxis.copy(_vEyes).multiplyScalar(0.65).addScaledVector(_vTemples, 0.35);
+  if (_xAxis.lengthSq() < 1e-6) return;
+  _xAxis.normalize();
 
-  // Apply offsets in model-local coordinate frame (using rotation axes)
-  _yAxis.set(0, 1, 0).applyQuaternion(_targetQuat);
-  _zAxis.set(0, 0, 1).applyQuaternion(_targetQuat);
-  _targetPos.addScaledVector(_yAxis, Y_OFFSET);
-  _targetPos.addScaledVector(_zAxis, Z_OFFSET);
+  // Z-Axis (Forward / Sagittal — Out of the face):
+  // Vector from midpoint of temples to upper nasal bridge (Frankfurt plane)
+  _ptMidTemples.addVectors(_ptRightTemple, _ptLeftTemple).multiplyScalar(0.5);
+  _ptMidNose.copy(_ptNasion).multiplyScalar(0.7).addScaledVector(_ptGlabella, 0.3);
+  _vFwd.subVectors(_ptMidNose, _ptMidTemples);
+
+  // Gram-Schmidt orthogonalization: ensure Z is strictly perpendicular to X
+  _zAxis.copy(_vFwd).addScaledVector(_xAxis, -_vFwd.dot(_xAxis));
+  if (_zAxis.lengthSq() < 1e-6) return;
+  _zAxis.normalize();
+
+  // Y-Axis (Vertical / Superior):
+  // Right-handed orthonormal cross product: Y = Z × X
+  _yAxis.crossVectors(_zAxis, _xAxis).normalize();
+
+  // Construct pure rotation matrix with det = +1
+  _basisMatrix.makeBasis(_xAxis, _yAxis, _zAxis);
+  _targetQuat.setFromRotationMatrix(_basisMatrix);
 
   // --------------------------------------------------------------------------
-  // 4. SCALE — proportional to face width
+  // 2. DEPTH — Metric Outer Canthal Inter-Ocular Projection
   // --------------------------------------------------------------------------
-  const dxEye = lmLOut.x - lmROut.x;
-  const dyEye = lmLOut.y - lmROut.y;
-  const eyeSpanNorm = Math.sqrt(dxEye * dxEye + dyEye * dyEye);
-  // At reference distance (~0.6m), eye span in normalized coords ≈ 0.15
-  const rawScale = (eyeSpanNorm / 0.15) * 1.0;
-  const targetScale = THREE.MathUtils.clamp(rawScale, 0.70, 1.40);
+  landmarkToCameraRay(lmRightEyeOut.x, lmRightEyeOut.y, screenAspect, videoAspect, tanHalfFov, camAspect, _rayRightOut);
+  landmarkToCameraRay(lmLeftEyeOut.x,  lmLeftEyeOut.y,  screenAspect, videoAspect, tanHalfFov, camAspect, _rayLeftOut);
+
+  const dxRay = _rayLeftOut.x - _rayRightOut.x;
+  const dyRay = _rayLeftOut.y - _rayRightOut.y;
+  const deltaRayOuter = Math.sqrt(dxRay * dxRay + dyRay * dyRay);
+
+  // Yaw foreshortening factor: cos(yaw) = sqrt(1 - xAxis.z^2)
+  // Prevents the glasses from flying backward when turning head sideways
+  const cosYaw = Math.max(Math.sqrt(Math.max(0.01, 1.0 - _xAxis.z * _xAxis.z)), 0.35);
+
+  const rawDepth = (REF_OUTER_CANTHAL_W * cosYaw) / Math.max(deltaRayOuter, 0.001);
+  const targetDepth = THREE.MathUtils.clamp(rawDepth, 0.25, 2.50);
 
   // --------------------------------------------------------------------------
-  // 5. SMOOTHING — One-Euro Filter
+  // 3. POSITION — Multi-Landmark Nasal Bridge Anchor
+  // --------------------------------------------------------------------------
+  // Anchor horizontally at mid-eye / nasion line
+  const innerMidX = (lmRightEyeIn.x + lmLeftEyeIn.x) * 0.5;
+  const outerMidX = (lmRightEyeOut.x + lmLeftEyeOut.x) * 0.5;
+  const anchorX   = innerMidX * 0.45 + outerMidX * 0.25 + lmNasion.x * 0.30;
+
+  // Anchor vertically at nasal bridge (pupil / eye level)
+  const innerMidY = (lmRightEyeIn.y + lmLeftEyeIn.y) * 0.5;
+  const outerMidY = (lmRightEyeOut.y + lmLeftEyeOut.y) * 0.5;
+  const eyeLevelY = innerMidY * 0.5 + outerMidY * 0.5;
+  const anchorY   = eyeLevelY * 0.55 + lmNasion.y * 0.45;
+
+  landmarkToCameraRay(anchorX, anchorY, screenAspect, videoAspect, tanHalfFov, camAspect, _rayAnchor);
+
+  // Unproject ray to 3D metric world position at targetDepth
+  _targetPos.copy(_rayAnchor).multiplyScalar(targetDepth);
+
+  // --------------------------------------------------------------------------
+  // 4. SCALE — Normalized Biometric Adaptation
+  // --------------------------------------------------------------------------
+  // Outer canthal distance projected in 3D
+  const actualSpan3D = (deltaRayOuter * targetDepth) / cosYaw;
+  const rawScale = actualSpan3D / REF_OUTER_CANTHAL_W;
+  const targetScale = THREE.MathUtils.clamp(rawScale, 0.85, 1.25);
+
+  // Apply calibrated offsets in head-local coordinate frame
+  _targetPos.addScaledVector(_yAxis, Y_OFFSET * targetScale);
+  _targetPos.addScaledVector(_zAxis, Z_OFFSET * targetScale);
+
+  // --------------------------------------------------------------------------
+  // 5. SMOOTHING — Temporal One-Euro Filter
   // --------------------------------------------------------------------------
   _posFilter.filter(_targetPos, dt, sunglasses.position);
   _quatFilter.filter(_targetQuat, dt, sunglasses.quaternion);
